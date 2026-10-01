@@ -233,22 +233,41 @@
                     </p>
 
                     <div id="FreetextListValues">
+                        <!-- Column headers -->
+                        <div class="FreetextListRow FreetextListHeader SpacingTop" style="font-weight: bold; display: flex; gap: 8px; align-items: center;">
+                            <label style="flex: 1; margin: 0; padding: 4px;">
+                                [% Translate("Display Name") | html %]
+                            </label>
+                            <label style="flex: 1; margin: 0; padding: 4px;">
+                                [% Translate("Value") | html %]
+                            </label>
+                            <span style="width: 30px;"></span>
+                        </div>
+
                         <!-- Hidden template row that JavaScript clones for new entries -->
-                        <div class="FreetextListRow SpacingTop" id="FreetextListRowTemplate" style="display:none;">
-                            <input type="text" name="PossibleValues_TEMPLATE"
-                                   class="W50pc" value=""
-                                   placeholder="[% Translate("Enter a value") | html %]" />
-                            <button type="button" class="btn-inline FreetextListRemoveRow" title="[% Translate("Remove value") | html %]">
+                        <div class="FreetextListRow FreetextListDataRow" id="FreetextListRowTemplate" style="display: none; flex: 1; display: flex; gap: 8px; align-items: center;">
+                            <input type="text" name="PossibleValuesName_TEMPLATE"
+                                   class="PossibleValuesName" style="flex: 1; min-width: 0;" 
+                                   value="" placeholder="[% Translate("Display name") | html %]" />
+                            <input type="text" name="PossibleValuesValue_TEMPLATE"
+                                   class="PossibleValuesValue" style="flex: 1; min-width: 0;" 
+                                   value="" placeholder="[% Translate("Value (if empty, use name)") | html %]" />
+                            <button type="button" class="btn-inline FreetextListRemoveRow" style="width: 30px; flex-shrink: 0; padding: 2px;" title="[% Translate("Remove value") | html %]">
                                 <i class="fa fa-minus-square-o"></i>
                             </button>
                         </div>
 
 [% RenderBlockStart("ValueRow") %]
-                        <div class="FreetextListRow SpacingTop">
-                            <input type="text" name="PossibleValues_[% Data.ValueIndex | html %]"
-                                   class="W50pc" value="[% Data.Value | html %]"
-                                   placeholder="[% Translate("Enter a value") | html %]" />
-                            <button type="button" class="btn-inline FreetextListRemoveRow" title="[% Translate("Remove value") | html %]">
+                        <div class="FreetextListRow FreetextListDataRow SpacingTop" style="display: flex; gap: 8px; align-items: center;">
+                            <input type="text" name="PossibleValuesName_[% Data.ValueIndex | html %]"
+                                   class="PossibleValuesName" style="flex: 1; min-width: 0;" 
+                                   value="[% Data.ValueName | html %]"
+                                   placeholder="[% Translate("Display name") | html %]" />
+                            <input type="text" name="PossibleValuesValue_[% Data.ValueIndex | html %]"
+                                   class="PossibleValuesValue" style="flex: 1; min-width: 0;" 
+                                   value="[% Data.ValueValue | html %]"
+                                   placeholder="[% Translate("Value (if empty, use name)") | html %]" />
+                            <button type="button" class="btn-inline FreetextListRemoveRow" style="width: 30px; flex-shrink: 0; padding: 2px;" title="[% Translate("Remove value") | html %]">
                                 <i class="fa fa-minus-square-o"></i>
                             </button>
                         </div>
@@ -297,40 +316,80 @@
     'use strict';
 
     var ValueCount = parseInt(document.getElementById('FreetextListValueCount').value, 10) || 0;
+    var ValuesContainer = document.getElementById('FreetextListValues');
+
+    // Function to wire up remove button on a row
+    function WireupRemoveButton(Button) {
+        Button.addEventListener('click', function (e) {
+            e.preventDefault();
+            var Row = Button.closest('.FreetextListDataRow');
+            if (Row) {
+                Row.remove();
+                FreetextListRenumber();
+            }
+        });
+    }
 
     // Add a new value row
-    document.getElementById('FreetextListAddRow').addEventListener('click', function () {
+    document.getElementById('FreetextListAddRow').addEventListener('click', function (e) {
+        e.preventDefault();
         var Template = document.getElementById('FreetextListRowTemplate');
         var NewRow   = Template.cloneNode(true);
 
         NewRow.removeAttribute('id');
         NewRow.style.display = '';
 
-        // Give the input a unique name
-        var Input = NewRow.querySelector('input[type="text"]');
-        Input.name  = 'PossibleValues_' + ValueCount;
-        Input.value = '';
+        // Give the inputs unique names
+        var NameInput = NewRow.querySelector('.PossibleValuesName');
+        var ValueInput = NewRow.querySelector('.PossibleValuesValue');
+        NameInput.name  = 'PossibleValuesName_' + ValueCount;
+        NameInput.value = '';
+        ValueInput.name  = 'PossibleValuesValue_' + ValueCount;
+        ValueInput.value = '';
         ValueCount++;
         document.getElementById('FreetextListValueCount').value = ValueCount;
 
-        // Wire up the remove button
-        NewRow.querySelector('.FreetextListRemoveRow').addEventListener('click', function () {
-            NewRow.parentNode.removeChild(NewRow);
-        });
+        // Wire up the remove button on new row
+        var RemoveButton = NewRow.querySelector('.FreetextListRemoveRow');
+        WireupRemoveButton(RemoveButton);
 
-        document.getElementById('FreetextListValues').appendChild(NewRow);
-        Input.focus();
+        ValuesContainer.appendChild(NewRow);
+        NameInput.focus();
     });
 
-    // Wire up remove buttons for pre-rendered rows
-    document.querySelectorAll('.FreetextListRemoveRow').forEach(function (Button) {
-        Button.addEventListener('click', function () {
-            var Row = Button.closest('.FreetextListRow');
+    // Wire up remove buttons for all rows (both pre-rendered and new)
+    ValuesContainer.addEventListener('click', function (e) {
+        if (e.target.closest('.FreetextListRemoveRow')) {
+            e.preventDefault();
+            var Button = e.target.closest('.FreetextListRemoveRow');
+            var Row = Button.closest('.FreetextListDataRow');
             if (Row) {
-                Row.parentNode.removeChild(Row);
+                Row.remove();
+                FreetextListRenumber();
             }
-        });
+        }
     });
+
+    // Re-index all visible rows so PossibleValuesName_N and PossibleValuesValue_N 
+    // indices are always sequential. This prevents gaps when intermediate rows are removed,
+    // which would cause the Perl reader to miss all entries after the gap.
+    function FreetextListRenumber() {
+        var Rows = ValuesContainer.querySelectorAll('.FreetextListDataRow');
+        var Counter = 0;
+        Rows.forEach(function (Row) {
+            var NameInput = Row.querySelector('.PossibleValuesName');
+            var ValueInput = Row.querySelector('.PossibleValuesValue');
+            if (NameInput) {
+                NameInput.setAttribute('name', 'PossibleValuesName_' + Counter);
+            }
+            if (ValueInput) {
+                ValueInput.setAttribute('name', 'PossibleValuesValue_' + Counter);
+            }
+            Counter++;
+        });
+        ValueCount = Counter;
+        document.getElementById('FreetextListValueCount').value = Counter;
+    }
 
     // "Save and continue" wires up the ContinueAfterSave hidden field
     var SubmitAndContinue = document.getElementById('SubmitAndContinue');

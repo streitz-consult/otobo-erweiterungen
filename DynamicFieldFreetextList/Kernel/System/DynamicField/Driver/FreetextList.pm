@@ -84,36 +84,278 @@ automatically extends that list with the new value.
 sub ValueSet {
     my ( $Self, %Param ) = @_;
 
-    # Delegate actual DB storage to the base class
-    my $Success = $Self->SUPER::ValueSet(%Param);
-    return $Success if !$Success;
-
-    # Only add to list when a non-empty scalar value was submitted
-    my $Value = $Param{Value};
-    return $Success if !defined $Value || ref $Value;
-    return $Success if $Value eq '';
-
-    my $DynamicFieldConfig = $Param{DynamicFieldConfig};
-    my $PossibleValues     = $DynamicFieldConfig->{Config}{PossibleValues} // {};
-
-    # Nothing to do if the value is already in the list
-    return $Success if exists $PossibleValues->{$Value};
-
-    # Extend the list with the new value (key == label for free-text items)
-    my %UpdatedValues = ( %{$PossibleValues}, $Value => $Value );
-
-    my $DynamicFieldObject = $Kernel::OM->Get('Kernel::System::DynamicField');
-
-    $DynamicFieldObject->DynamicFieldUpdate(
-        %{$DynamicFieldConfig},
-        Config => {
-            %{ $DynamicFieldConfig->{Config} },
-            PossibleValues => \%UpdatedValues,
-        },
-        UserID => $Param{UserID},
+    # Store the submitted value directly via DynamicFieldValue (stable across all OTOBO versions).
+    my $Success = $Kernel::OM->Get('Kernel::System::DynamicFieldValue')->ValueSet(
+        FieldID  => $Param{DynamicFieldConfig}->{ID},
+        ObjectID => $Param{ObjectID},
+        Value    => [ { ValueText => $Param{Value} } ],
+        UserID   => $Param{UserID},
     );
 
+    return if !$Success;
+
+    # Extract the actual value — it may come as an array ref or scalar
+    my $Value = $Param{Value};
+    if ( IsArrayRefWithData($Value) ) {
+        $Value = $Value->[0];
+    }
+
+    # Only auto-extend the list for non-empty scalar values
+    return $Success if !defined $Value || ref $Value || $Value eq '';
+
+    # Trim whitespace
+    $Value =~ s/^\s+|\s+$//g;
+    return $Success if $Value eq '';
+
+    my $LogObject = $Kernel::OM->Get('Kernel::System::Log');
+
+    $LogObject->Log(
+        Priority => 'debug',
+        Message  => "FreetextList: ValueSet called with Value='$Value', FieldID=$Param{DynamicFieldConfig}->{ID}",
+    );
+
+    # The DynamicFieldConfig passed to ValueSet may be incomplete.
+    # Reload the full config to ensure all fields are present and up-to-date from DB.
+    my $FullFieldConfig = $Kernel::OM->Get('Kernel::System::DynamicField')->DynamicFieldGet(
+        ID => $Param{DynamicFieldConfig}->{ID},
+    );
+
+    if ( !IsHashRefWithData($FullFieldConfig) ) {
+        $LogObject->Log(
+            Priority => 'error',
+            Message  => "FreetextList: Could not reload field config for ID $Param{DynamicFieldConfig}->{ID}",
+        );
+        return $Success;
+    }
+
+    # Now get the PossibleValues from the FRESHLY loaded config (not from Param)
+    my $PossibleValues = $FullFieldConfig->{Config}{PossibleValues} // {};
+
+    # Validate PossibleValues is actually a hash reference
+    if ( !IsHashRefWithData($PossibleValues) ) {
+        $LogObject->Log(
+            Priority => 'warn',
+            Message  => "FreetextList: PossibleValues is not a valid HASH! Current type: "
+                . ref($PossibleValues)
+                . ", Value: " . ( defined $PossibleValues ? $PossibleValues : 'undef' ),
+        );
+        $PossibleValues = {};
+    }
+
+    $LogObject->Log(
+        Priority => 'debug',
+        Message  => "FreetextList: Current PossibleValues from DB (count=" 
+            . scalar( keys %{$PossibleValues} ) . "): " 
+            . join(', ', sort keys %{$PossibleValues}),
+    );
+
+    # Nothing to do if the value is already in the configured list
+    if ( exists $PossibleValues->{$Value} ) {
+        $LogObject->Log(
+            Priority => 'debug',
+            Message  => "FreetextList: Value '$Value' already exists in PossibleValues, no update needed",
+        );
+        return $Success;
+    }
+
+    $LogObject->Log(
+        Priority => 'debug',
+        Message  => "FreetextList: Auto-extending PossibleValues with new value '$Value'",
+    );
+
+    # Extend the list so the new value is available as autocomplete suggestion next time.
+    # Important: copy all existing values to prevent data loss.
+    my %UpdatedValues = %{$PossibleValues};
+    $UpdatedValues{$Value} = $Value;
+
+    $LogObject->Log(
+        Priority => 'debug',
+        Message  => "FreetextList: Updated PossibleValues will be: " . join(', ', sort keys %UpdatedValues),
+    );
+
+    # Build the updated config: We must use deep copy to preserve complex config structures
+    # Don't use shallow copy here as it can corrupt nested references
+    my %UpdatedConfig = ();
+    
+    # Copy all existing config values first
+    for my $ConfigKey ( keys %{ $FullFieldConfig->{Config} } ) {
+        if ( $ConfigKey eq 'PossibleValues' ) {
+            # Don't copy PossibleValues yet, we'll set it explicitly below
+            next;
+        }
+        
+        # For non-reference values, copy directly
+        if ( !ref $FullFieldConfig->{Config}{$ConfigKey} ) {
+            $UpdatedConfig{$ConfigKey} = $FullFieldConfig->{Config}{$ConfigKey};
+        }
+        # For hash references, make a proper copy
+        elsif ( ref $FullFieldConfig->{Config}{$ConfigKey} eq 'HASH' ) {
+            $UpdatedConfig{$ConfigKey} = { %{ $FullFieldConfig->{Config}{$ConfigKey} } };
+        }
+        # For array references, make a proper copy
+        elsif ( ref $FullFieldConfig->{Config}{$ConfigKey} eq 'ARRAY' ) {
+            $UpdatedConfig{$ConfigKey} = [ @{ $FullFieldConfig->{Config}{$ConfigKey} } ];
+        }
+        # For other reference types, copy the reference as-is
+        else {
+            $UpdatedConfig{$ConfigKey} = $FullFieldConfig->{Config}{$ConfigKey};
+        }
+    }
+    
+    # Now set the updated PossibleValues
+    $UpdatedConfig{PossibleValues} = \%UpdatedValues;
+
+    # Now perform the update with the complete config
+    my $UpdateSuccess = eval {
+        $Kernel::OM->Get('Kernel::System::DynamicField')->DynamicFieldUpdate(
+            ID         => $FullFieldConfig->{ID},
+            Name       => $FullFieldConfig->{Name},
+            Label      => $FullFieldConfig->{Label},
+            FieldOrder => $FullFieldConfig->{FieldOrder},
+            FieldType  => $FullFieldConfig->{FieldType},
+            ObjectType => $FullFieldConfig->{ObjectType},
+            ValidID    => $FullFieldConfig->{ValidID},
+            Config     => \%UpdatedConfig,
+            UserID     => $Param{UserID},
+        );
+    };
+
+    if ( my $Error = $@ ) {
+        $LogObject->Log(
+            Priority => 'error',
+            Message  => "FreetextList: Exception during DynamicFieldUpdate for value '$Value': $Error",
+        );
+        return $Success;
+    }
+
+    if ( !$UpdateSuccess ) {
+        $LogObject->Log(
+            Priority => 'error',
+            Message  => "FreetextList: DynamicFieldUpdate returned false for value '$Value' (ID: $FullFieldConfig->{ID})",
+        );
+    }
+    else {
+        $LogObject->Log(
+            Priority => 'debug',
+            Message  => "FreetextList: Successfully added value '$Value' to PossibleValues",
+        );
+
+        # Clear the DynamicField cache so EditFieldRender and other methods
+        # pick up the updated PossibleValues list immediately.
+        # We need to delete multiple cache keys because different parts of the system
+        # may cache the DynamicField config under different keys.
+        my $CacheObj = $Kernel::OM->Get('Kernel::System::Cache');
+        
+        # Delete ID-based cache (primary cache key)
+        $CacheObj->Delete(
+            Type => 'DynamicField',
+            Key  => "DynamicFieldGet::ID::$FullFieldConfig->{ID}",
+        );
+        
+        # Delete Name-based cache (secondary cache key)
+        $CacheObj->Delete(
+            Type => 'DynamicField',
+            Key  => "DynamicFieldGet::Name::$FullFieldConfig->{Name}",
+        );
+        
+        # Delete full DynamicFieldList cache
+        $CacheObj->Delete(
+            Type => 'DynamicFieldList',
+            Key  => 'DynamicFieldList',
+        );
+        
+        # Delete Backend cache (used by DynamicField::Backend)
+        $CacheObj->Delete(
+            Type => 'DynamicField',
+            Key  => 'DynamicFieldListGet',
+        );
+        
+        # Also delete the list caches for different object types and valid combinations
+        for my $ObjectType (qw(Article ITSMConfigItem Ticket)) {
+            for my $Valid (0, 1) {
+                $CacheObj->Delete(
+                    Type => 'DynamicFieldList',
+                    Key  => "DynamicFieldListGet::Valid::${Valid}::ObjectType::${ObjectType}",
+                );
+            }
+        }
+
+        $LogObject->Log(
+            Priority => 'debug',
+            Message  => "FreetextList: Cleared all relevant caches for ID $FullFieldConfig->{ID}",
+        );
+    }
+
     return $Success;
+}
+
+=head2 PossibleValuesGet()
+
+Returns the list of predefined values for this field.
+Called by the OTOBO Backend layer before rendering, so the result is used
+everywhere possible values are needed (datalist, stats, search, …).
+
+=cut
+
+sub PossibleValuesGet {
+    my ( $Self, %Param ) = @_;
+
+    # If a caller-supplied filter was explicitly provided, honour it.
+    if ( IsHashRefWithData( $Param{PossibleValuesFilter} ) ) {
+        return $Param{PossibleValuesFilter};
+    }
+
+    # IMPORTANT: We must ensure we get fresh data from the database, not cached data.
+    # When ValueSet() adds new values, the cache is invalidated, but the DynamicFieldConfig
+    # parameter passed to us might still be stale. So we reload from DB if we have an ID.
+    
+    my $PossibleValues = $Param{DynamicFieldConfig}->{Config}{PossibleValues} // {};
+    
+    # If we have a field ID, reload the config from DB to ensure we get the latest values
+    if ( $Param{DynamicFieldConfig}->{ID} ) {
+        my $LogObject = $Kernel::OM->Get('Kernel::System::Log');
+        
+        $LogObject->Log(
+            Priority => 'debug',
+            Message  => "FreetextList::PossibleValuesGet: Reloading fresh config from DB for field ID "
+                . $Param{DynamicFieldConfig}->{ID}
+                . " (initial count: " . scalar( keys %{$PossibleValues} ) . ")",
+        );
+        
+        my $FreshConfig = $Kernel::OM->Get('Kernel::System::DynamicField')->DynamicFieldGet(
+            ID => $Param{DynamicFieldConfig}->{ID},
+        );
+        
+        if ( IsHashRefWithData($FreshConfig) && IsHashRefWithData( $FreshConfig->{Config} ) ) {
+            my $FreshPossibleValues = $FreshConfig->{Config}{PossibleValues} // {};
+            
+            if ( IsHashRefWithData($FreshPossibleValues) ) {
+                $LogObject->Log(
+                    Priority => 'debug',
+                    Message  => "FreetextList::PossibleValuesGet: Fresh config loaded, count: "
+                        . scalar( keys %{$FreshPossibleValues} )
+                        . ", Values: " . join(', ', sort keys %{$FreshPossibleValues}),
+                );
+                
+                return $FreshPossibleValues;
+            }
+            else {
+                $LogObject->Log(
+                    Priority => 'warn',
+                    Message  => "FreetextList::PossibleValuesGet: Fresh config PossibleValues is not a HASH!",
+                );
+            }
+        }
+        else {
+            $LogObject->Log(
+                Priority => 'warn',
+                Message  => "FreetextList::PossibleValuesGet: Could not load fresh config for ID "
+                    . $Param{DynamicFieldConfig}->{ID},
+            );
+        }
+    }
+
+    return $PossibleValues;
 }
 
 =head2 EditFieldRender()
@@ -127,58 +369,53 @@ suggestions while still allowing arbitrary free-text input.
 sub EditFieldRender {
     my ( $Self, %Param ) = @_;
 
-    my $FieldConfig = $Param{DynamicFieldConfig}->{Config};
-    my $FieldName   = 'DynamicField_' . $Param{DynamicFieldConfig}->{Name};
-    my $FieldID     = $FieldName;
-    my $DatalistID  = $FieldName . '_Datalist';
+    my $FieldName  = 'DynamicField_' . $Param{DynamicFieldConfig}->{Name};
+    my $DatalistID = $FieldName . '_Datalist';
 
-    # Determine current value - prefer submitted over stored
+    # Current value: prefer submitted param over stored value
     my $Value = '';
-    if ( defined $Param{Value} ) {
+    if ( defined $Param{Value} && !ref $Param{Value} ) {
         $Value = $Param{Value};
     }
 
-    my $Mandatory   = $Param{Mandatory}   ? '1' : '0';
+    my $Mandatory   = $Param{Mandatory}   ? 1 : 0;
     my $ServerError = $Param{ServerError} ? 'ServerError' : '';
 
-    # Build <option> tags for the datalist from the configured list
-    my $PossibleValues = $FieldConfig->{PossibleValues} // {};
+    # Use PossibleValuesGet so the OTOBO Backend layer's normalisation and any
+    # configured PossibleValuesFilter are both respected.
+    my $PossibleValues  = $Self->PossibleValuesGet(%Param);
+    
+    my $LogObject = $Kernel::OM->Get('Kernel::System::Log');
+    $LogObject->Log(
+        Priority => 'debug',
+        Message  => "FreetextList::EditFieldRender: Field="
+            . $Param{DynamicFieldConfig}->{Name}
+            . " has " . scalar( keys %{$PossibleValues} ) . " possible values: "
+            . join(', ', sort keys %{$PossibleValues}),
+    );
+    
     my $DatalistOptions = '';
     for my $Key ( sort keys %{$PossibleValues} ) {
         my $EscapedKey = $Param{LayoutObject}->Ascii2Html( Text => $Key );
-        $DatalistOptions .= "            <option value=\"$EscapedKey\">\n";
+        $DatalistOptions .= "    <option value=\"$EscapedKey\">\n";
     }
 
     my $ValidateClass = $Mandatory ? ' Validate_Required' : '';
     my $EscapedValue  = $Param{LayoutObject}->Ascii2Html( Text => $Value );
 
-    my $HTMLString = <<"HTML";
-        <input type="text"
-               id="$FieldID"
-               name="$FieldName"
-               list="$DatalistID"
-               class="W50pc$ValidateClass $ServerError"
-               value="$EscapedValue"
-               autocomplete="off" />
-        <datalist id="$DatalistID">
-$DatalistOptions        </datalist>
-HTML
+    # Build raw HTML — no inline TT2 so we avoid the Output(Template=>) file-lookup issue.
+    # Translations are resolved via LanguageObject directly.
+    my $FieldHTML = qq{<input type="text" id="$FieldName" name="$FieldName" list="$DatalistID" }
+        . qq{class="W50pc$ValidateClass $ServerError" value="$EscapedValue" autocomplete="off" />\n}
+        . qq{<datalist id="$DatalistID">\n$DatalistOptions</datalist>\n};
 
     if ($Mandatory) {
-        $HTMLString .= <<"HTML";
-        <div id="${FieldID}Error" class="TooltipErrorMessage">
-            <p>[% Translate("This field is required.") | html %]</p>
-        </div>
-        <div id="${FieldID}ServerError" class="TooltipErrorMessage">
-            <p>[% Translate("This field is required.") | html %]</p>
-        </div>
-HTML
+        my $RequiredMsg = $Param{LayoutObject}->Ascii2Html(
+            Text => $Param{LayoutObject}->{LanguageObject}->Translate('This field is required.'),
+        );
+        $FieldHTML .= qq{<div id="${FieldName}Error" class="TooltipErrorMessage"><p>$RequiredMsg</p></div>\n};
+        $FieldHTML .= qq{<div id="${FieldName}ServerError" class="TooltipErrorMessage"><p>$RequiredMsg</p></div>\n};
     }
-
-    # Render via Layout->Output so TT blocks are processed
-    my $Field = $Param{LayoutObject}->Output(
-        Template => $HTMLString,
-    );
 
     my $Label = $Self->EditLabelRender(
         %Param,
@@ -188,7 +425,7 @@ HTML
     );
 
     return {
-        Field => $Field,
+        Field => $FieldHTML,
         Label => $Label,
     };
 }
@@ -201,6 +438,9 @@ Returns the submitted text value for this field.
 
 sub EditFieldValueGet {
     my ( $Self, %Param ) = @_;
+
+    # ParamObject is not always provided (e.g. GenericAgent template context)
+    return if !$Param{ParamObject};
 
     my $FieldName = 'DynamicField_' . $Param{DynamicFieldConfig}->{Name};
 
@@ -240,7 +480,8 @@ sub DisplayValueRender {
 
     my $Value = defined $Param{Value} ? $Param{Value} : '';
 
-    if ( $Param{HTMLOutput} ) {
+    # HTMLOutput defaults to 1 (show HTML-escaped value)
+    if ( $Param{HTMLOutput} // 1 ) {
         $Value = $Param{LayoutObject}->Ascii2Html(
             Text => $Value,
             Max  => $Param{ValueMaxChars} || '',
@@ -278,9 +519,7 @@ sub SearchFieldRender {
 
     my $EscapedValue = $Param{LayoutObject}->Ascii2Html( Text => $Value );
 
-    my $HTMLString = <<"HTML";
-        <input type="text" id="$FieldName" name="$FieldName" value="$EscapedValue" class="W50pc" />
-HTML
+    my $HTMLString = qq{<input type="text" id="$FieldName" name="$FieldName" value="$EscapedValue" class="W50pc" />\n};
 
     my $Label = $Self->EditLabelRender(
         %Param,
@@ -305,14 +544,11 @@ sub SearchFieldValueGet {
 
     my $FieldName = 'Search_DynamicField_' . $Param{DynamicFieldConfig}->{Name};
 
-    if ( $Param{Type} eq 'CustomerInterface' ) {
-        $FieldName = 'Search_DynamicField_' . $Param{DynamicFieldConfig}->{Name};
-    }
-
-    if ( $Param{Profile} ) {
+    if ( IsHashRefWithData( $Param{Profile} ) ) {
         return $Param{Profile}->{$FieldName};
     }
 
+    return if !$Param{ParamObject};
     return $Param{ParamObject}->GetParam( Param => $FieldName );
 }
 

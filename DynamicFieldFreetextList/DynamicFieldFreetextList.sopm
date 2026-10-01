@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<otrs_package version="1.0">
+    <Name>DynamicFieldFreetextList</Name>
+    <Version>1.0.17</Version>
+
+    <!-- Adjust the Framework version(s) to match your OTOBO installation -->
+    <Framework>10.0.x</Framework>
+    <Framework>11.0.x</Framework>
+
+    <Vendor>Streitz Consult GmbH</Vendor>
+    <URL>https://streitz-consult.de</URL>
+    <License>GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007</License>
+
+    <Description Lang="en">
+        Adds a new dynamic field type "Freetext List" that combines a free-text input with
+        a configurable predefined list of values. Users can either select an existing value
+        from the autocomplete list or type any custom text. Custom values that are not yet
+        in the list are automatically added to it for future use.
+    </Description>
+    <Description Lang="de">
+        Fügt einen neuen Typ für dynamische Felder "Freitextfeld mit Liste" hinzu, der eine
+        freie Texteingabe mit einer konfigurierbaren vordefinierten Werteliste kombiniert.
+        Benutzer können entweder einen vorhandenen Wert aus der Autovervollständigungs-Liste
+        auswählen oder einen beliebigen eigenen Text eingeben. Neu eingegebene Werte, die
+        noch nicht in der Liste vorhanden sind, werden automatisch hinzugefügt.
+    </Description>
+
+    <Filelist>
+        <File Permission="660" Location="Kernel/Config/Files/XML/OTOBODynamicFieldFreetextList.xml"/>
+        <File Permission="660" Location="Kernel/Language/de_OTOBODynamicFieldFreetextList.pm"/>
+        <File Permission="660" Location="Kernel/Modules/AdminDynamicFieldFreetextList.pm"/>
+        <File Permission="660" Location="Kernel/Output/HTML/Templates/Standard/AdminDynamicFieldFreetextList.tt"/>
+        <File Permission="660" Location="Kernel/System/DynamicField/Driver/FreetextList.pm"/>
+    </Filelist>
+
+    <!--
+        No database schema changes are required.
+        The driver reuses the existing dynamic_field and dynamic_field_value tables.
+
+        After installation, run the SysConfig deployment so that the XML configuration
+        is picked up:
+            bin/otobo.Console.pl Maint::Config::Rebuild
+            bin/otobo.Console.pl Maint::Config::Deploy
+    -->
+
+    <CodeInstall Type="post"><![CDATA[
+        # Discard any cached SysConfig object so we get a fresh instance that is
+        # aware of the newly installed XML file.
+        $Kernel::OM->ObjectsDiscard( Objects => ['Kernel::System::SysConfig'] );
+
+        my $SysConfigObject = $Kernel::OM->Get('Kernel::System::SysConfig');
+
+        # Import all XML SysConfig files — picks up the newly installed one.
+        $SysConfigObject->ConfigurationXML2DB(
+            UserID => 1,
+            Force  => 1,
+        );
+
+        # Write the deployed configuration to Kernel/Config/Files/ZZZAAuto.pm.
+        my $DeploySuccess = $SysConfigObject->ConfigurationDeploy(
+            Comments    => 'DynamicFieldFreetextList installed',
+            UserID      => 1,
+            Force       => 1,
+            AllSettings => 1,
+        );
+
+        if ( !$DeploySuccess ) {
+            $Kernel::OM->Get('Kernel::System::Log')->Log(
+                Priority => 'error',
+                Message  => 'DynamicFieldFreetextList: ConfigurationDeploy failed after install!',
+            );
+        }
+
+        # Flush all caches so every subsequent request reads the fresh configuration.
+        $Kernel::OM->Get('Kernel::System::Cache')->CleanUp();
+    ]]></CodeInstall>
+
+    <CodeUpgrade Type="post"><![CDATA[
+        # Same steps as CodeInstall — run after every package upgrade.
+        $Kernel::OM->ObjectsDiscard( Objects => ['Kernel::System::SysConfig'] );
+
+        my $SysConfigObject = $Kernel::OM->Get('Kernel::System::SysConfig');
+
+        $SysConfigObject->ConfigurationXML2DB(
+            UserID => 1,
+            Force  => 1,
+        );
+
+        my $DeploySuccess = $SysConfigObject->ConfigurationDeploy(
+            Comments    => 'DynamicFieldFreetextList upgraded',
+            UserID      => 1,
+            Force       => 1,
+            AllSettings => 1,
+        );
+
+        if ( !$DeploySuccess ) {
+            $Kernel::OM->Get('Kernel::System::Log')->Log(
+                Priority => 'error',
+                Message  => 'DynamicFieldFreetextList: ConfigurationDeploy failed after upgrade!',
+            );
+        }
+
+        $Kernel::OM->Get('Kernel::System::Cache')->CleanUp();
+    ]]></CodeUpgrade>
+
+    <CodeUninstall Type="pre"><![CDATA[
+        # Redeploy without the package's settings before files are removed.
+        $Kernel::OM->ObjectsDiscard( Objects => ['Kernel::System::SysConfig'] );
+
+        my $SysConfigObject = $Kernel::OM->Get('Kernel::System::SysConfig');
+
+        $SysConfigObject->ConfigurationDeploy(
+            Comments    => 'DynamicFieldFreetextList uninstalled',
+            UserID      => 1,
+            Force       => 1,
+            AllSettings => 1,
+        );
+
+        $Kernel::OM->Get('Kernel::System::Cache')->CleanUp();
+    ]]></CodeUninstall>
+
+</otrs_package>

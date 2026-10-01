@@ -212,6 +212,25 @@ sub _AddAction {
         return $LayoutObject->ErrorScreen( Message => Translatable('Could not create the new field') );
     }
 
+    # Clear DynamicFieldList cache so the new field appears immediately
+    my $CacheObj = $Kernel::OM->Get('Kernel::System::Cache');
+    $CacheObj->Delete(
+        Type => 'DynamicFieldList',
+        Key  => 'DynamicFieldList',
+    );
+    $CacheObj->Delete(
+        Type => 'DynamicField',
+        Key  => 'DynamicFieldListGet',
+    );
+    for my $ObjectType (qw(Article ITSMConfigItem Ticket)) {
+        for my $Valid (0, 1) {
+            $CacheObj->Delete(
+                Type => 'DynamicFieldList',
+                Key  => "DynamicFieldListGet::Valid::${Valid}::ObjectType::${ObjectType}",
+            );
+        }
+    }
+
     return $LayoutObject->Redirect(
         OP => $Self->_RedirectString( %GetParam, LayoutObject => $LayoutObject ),
     );
@@ -390,6 +409,41 @@ sub _ChangeAction {
         return $Self->_ShowScreen( %Param, %Errors, %GetParam, ID => $FieldID, Mode => 'Change' );
     }
 
+    # Build the updated config: copy all existing config values from the DB
+    my %UpdatedConfig = ();
+    
+    # Copy all existing config values from the DB
+    if ( IsHashRefWithData( $DynamicFieldData->{Config} ) ) {
+        for my $ConfigKey ( keys %{ $DynamicFieldData->{Config} } ) {
+            if ( $ConfigKey eq 'PossibleValues' ) {
+                # Don't copy PossibleValues yet, we'll set it explicitly below
+                next;
+            }
+            
+            # For non-reference values, copy directly
+            if ( !ref $DynamicFieldData->{Config}{$ConfigKey} ) {
+                $UpdatedConfig{$ConfigKey} = $DynamicFieldData->{Config}{$ConfigKey};
+            }
+            # For hash references, make a proper copy
+            elsif ( ref $DynamicFieldData->{Config}{$ConfigKey} eq 'HASH' ) {
+                $UpdatedConfig{$ConfigKey} = { %{ $DynamicFieldData->{Config}{$ConfigKey} } };
+            }
+            # For array references, make a proper copy
+            elsif ( ref $DynamicFieldData->{Config}{$ConfigKey} eq 'ARRAY' ) {
+                $UpdatedConfig{$ConfigKey} = [ @{ $DynamicFieldData->{Config}{$ConfigKey} } ];
+            }
+            # For other reference types, copy as-is
+            else {
+                $UpdatedConfig{$ConfigKey} = $DynamicFieldData->{Config}{$ConfigKey};
+            }
+        }
+    }
+    
+    # Set PossibleValues to ONLY what the admin defined
+    # Do NOT merge with existing values - this allows admins to delete values
+    # Auto-added values (from ValueSet() in the driver) will be managed separately by ValueSet()
+    $UpdatedConfig{PossibleValues} = $GetParam{PossibleValues};
+
     my $UpdateSuccess = $DynamicFieldObject->DynamicFieldUpdate(
         ID         => $FieldID,
         Name       => $GetParam{Name},
@@ -397,7 +451,7 @@ sub _ChangeAction {
         FieldOrder => $GetParam{FieldOrder},
         FieldType  => $DynamicFieldData->{FieldType},
         ObjectType => $DynamicFieldData->{ObjectType},
-        Config     => { PossibleValues => $GetParam{PossibleValues} },
+        Config     => \%UpdatedConfig,
         ValidID    => $GetParam{ValidID},
         UserID     => $Self->{UserID},
     );
@@ -408,6 +462,44 @@ sub _ChangeAction {
                 'Could not update the field %s', $GetParam{Name}
             ),
         );
+    }
+
+    # Clear the DynamicField cache after updating PossibleValues
+    # so that EditFieldRender and other methods pick up the changes immediately
+    my $CacheObj = $Kernel::OM->Get('Kernel::System::Cache');
+    
+    # Delete ID-based cache (primary cache key)
+    $CacheObj->Delete(
+        Type => 'DynamicField',
+        Key  => "DynamicFieldGet::ID::$FieldID",
+    );
+    
+    # Delete Name-based cache (secondary cache key)
+    $CacheObj->Delete(
+        Type => 'DynamicField',
+        Key  => "DynamicFieldGet::Name::$DynamicFieldData->{Name}",
+    );
+    
+    # Delete full DynamicFieldList cache
+    $CacheObj->Delete(
+        Type => 'DynamicFieldList',
+        Key  => 'DynamicFieldList',
+    );
+    
+    # Delete Backend cache (used by DynamicField::Backend)
+    $CacheObj->Delete(
+        Type => 'DynamicField',
+        Key  => 'DynamicFieldListGet',
+    );
+    
+    # Also delete the list caches for different object types and valid combinations
+    for my $ObjectType (qw(Article ITSMConfigItem Ticket)) {
+        for my $Valid (0, 1) {
+            $CacheObj->Delete(
+                Type => 'DynamicFieldList',
+                Key  => "DynamicFieldListGet::Valid::${Valid}::ObjectType::${ObjectType}",
+            );
+        }
     }
 
     # Propagate name change to SysConfig if confirmed
@@ -548,12 +640,19 @@ sub _ShowScreen {
 
     # Prepare the list of predefined values for the template
     my $PossibleValues = $Param{PossibleValues} // {};
+    
     my @PossibleValuesList;
-    for my $Key ( sort keys %{$PossibleValues} ) {
-        push @PossibleValuesList, { Value => $Key };
+    if ( IsHashRefWithData($PossibleValues) ) {
+        for my $Key ( sort keys %{$PossibleValues} ) {
+            push @PossibleValuesList, { 
+                ValueName  => $Key,
+                ValueValue => $PossibleValues->{$Key},
+            };
+        }
     }
+    
     # Ensure at least one empty row for adding values
-    push @PossibleValuesList, { Value => '' };
+    push @PossibleValuesList, { ValueName => '', ValueValue => '' };
 
     # Render each existing value row
     my $ValueIndex = 0;
@@ -562,7 +661,8 @@ sub _ShowScreen {
             Name => 'ValueRow',
             Data => {
                 ValueIndex => $ValueIndex,
-                Value      => $Row->{Value},
+                ValueName  => $Row->{ValueName},
+                ValueValue => $Row->{ValueValue},
             },
         );
         $ValueIndex++;
@@ -629,20 +729,32 @@ sub _ShowScreen {
 # Private helpers
 # ---------------------------------------------------------------------------
 
-# Reads all PossibleValues_<n> form params and returns a hash ref.
+# Reads all PossibleValuesName_<n> and PossibleValuesValue_<n> form params and returns a hash ref.
+# Structure: { "Name" => "Value", ... }
+# If Value is empty, uses Name as the Value.
 sub _GetPossibleValues {
     my ( $Self, %Param ) = @_;
 
     my $ParamObject = $Param{ParamObject};
     my %Values;
 
-    my $Index = 0;
-    while (1) {
-        my $Value = $ParamObject->GetParam( Param => "PossibleValues_$Index" );
-        last if !defined $Value;
-        $Value =~ s/^\s+|\s+$//g;    # trim whitespace
-        $Values{$Value} = $Value if length $Value;
-        $Index++;
+    # Scan a large range instead of stopping at the first missing index.
+    # When the user removes an intermediate row in the UI, the remaining rows
+    # keep their original non-sequential indices.
+    INDEX:
+    for my $Index ( 0 .. 999 ) {
+        my $Name = $ParamObject->GetParam( Param => "PossibleValuesName_$Index" );
+        next INDEX if !defined $Name;
+        
+        $Name =~ s/^\s+|\s+$//g;    # trim whitespace
+        next INDEX if !length $Name;  # skip empty names
+        
+        # Get the value, or use the name if empty
+        my $Value = $ParamObject->GetParam( Param => "PossibleValuesValue_$Index" ) // '';
+        $Value =~ s/^\s+|\s+$//g;   # trim whitespace
+        $Value = $Name if !length $Value;  # use Name as fallback if Value is empty
+        
+        $Values{$Name} = $Value;
     }
 
     return \%Values;
