@@ -1,6 +1,6 @@
 param (
     [string] $SopmPath  = (Join-Path $PSScriptRoot 'DynamicFieldFreetextList.sopm'),
-    [string] $OutputDir = $PSScriptRoot
+    [string] $OutputDir = (Join-Path $PSScriptRoot 'Release')
 )
 
 Set-StrictMode -Version Latest
